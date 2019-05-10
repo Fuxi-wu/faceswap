@@ -1,23 +1,31 @@
 #!/usr/bin python3
 """ Information on available Nvidia GPUs """
 
+import logging
+import os
 import platform
 
 if platform.system() == 'Darwin':
-    import pynvx
-    is_macos = True
+    import pynvx  # pylint: disable=import-error
+    IS_MACOS = True
 else:
     import pynvml
-    is_macos = False
+    IS_MACOS = False
 
 
-class GPUStats(object):
+class GPUStats():
     """ Holds information about system GPU(s) """
-    def __init__(self):
-        self.verbose = False
+    def __init__(self, log=True):
+        self.logger = None
+        if log:
+            # Logger is held internally, as we don't want to log
+            # when obtaining system stats on crash
+            self.logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
+            self.logger.debug("Initializing %s", self.__class__.__name__)
 
         self.initialized = False
         self.device_count = 0
+        self.active_devices = None
         self.handles = None
         self.driver = None
         self.devices = None
@@ -25,19 +33,24 @@ class GPUStats(object):
 
         self.initialize()
 
-        if self.device_count == 0:
-            return
-
         self.driver = self.get_driver()
         self.devices = self.get_devices()
         self.vram = self.get_vram()
+        if not self.active_devices:
+            if self.logger:
+                self.logger.warning("No GPU detected. Switching to CPU mode")
+            return
 
         self.shutdown()
+        if self.logger:
+            self.logger.debug("Initialized %s", self.__class__.__name__)
 
     def initialize(self):
         """ Initialize pynvml """
         if not self.initialized:
-            if is_macos:
+            if IS_MACOS:
+                if self.logger:
+                    self.logger.debug("macOS Detected. Using pynvx")
                 try:
                     pynvx.cudaInit()
                 except RuntimeError:
@@ -45,78 +58,109 @@ class GPUStats(object):
                     return
             else:
                 try:
+                    if self.logger:
+                        self.logger.debug("OS is not macOS. Using pynvml")
                     pynvml.nvmlInit()
-                except pynvml.NVMLError_LibraryNotFound:
+                except (pynvml.NVMLError_LibraryNotFound,  # pylint: disable=no-member
+                        pynvml.NVMLError_DriverNotLoaded,  # pylint: disable=no-member
+                        pynvml.NVMLError_NoPermission):  # pylint: disable=no-member
                     self.initialized = True
                     return
             self.initialized = True
             self.get_device_count()
+            self.get_active_devices()
             self.get_handles()
 
     def shutdown(self):
         """ Shutdown pynvml """
         if self.initialized:
             self.handles = None
-            if not is_macos:
+            if not IS_MACOS:
                 pynvml.nvmlShutdown()
             self.initialized = False
 
     def get_device_count(self):
         """ Return count of Nvidia devices """
-        if is_macos:
+        if IS_MACOS:
             self.device_count = pynvx.cudaDeviceGetCount(ignore=True)
         else:
             try:
                 self.device_count = pynvml.nvmlDeviceGetCount()
             except pynvml.NVMLError:
                 self.device_count = 0
+        if self.logger:
+            self.logger.debug("GPU Device count: %s", self.device_count)
+
+    def get_active_devices(self):
+        """ Return list of active Nvidia devices """
+        devices = os.environ.get("CUDA_VISIBLE_DEVICES", None)
+        if self.device_count == 0:
+            self.active_devices = list()
+        elif devices is not None:
+            self.active_devices = [int(i) for i in devices.split(",") if devices]
+        else:
+            self.active_devices = list(range(self.device_count))
+        if self.logger:
+            self.logger.debug("Active GPU Devices: %s", self.active_devices)
 
     def get_handles(self):
         """ Return all listed Nvidia handles """
-        if is_macos:
+        if IS_MACOS:
             self.handles = pynvx.cudaDeviceGetHandles(ignore=True)
         else:
             self.handles = [pynvml.nvmlDeviceGetHandleByIndex(i)
                             for i in range(self.device_count)]
+        if self.logger:
+            self.logger.debug("GPU Handles found: %s", len(self.handles))
 
-    @staticmethod
-    def get_driver():
+    def get_driver(self):
         """ Get the driver version """
-        if is_macos:
+        if IS_MACOS:
             driver = pynvx.cudaSystemGetDriverVersion(ignore=True)
         else:
             try:
                 driver = pynvml.nvmlSystemGetDriverVersion().decode("utf-8")
             except pynvml.NVMLError:
                 driver = "No Nvidia driver found"
+        if self.logger:
+            self.logger.debug("GPU Driver: %s", driver)
         return driver
 
     def get_devices(self):
         """ Return name of devices """
         self.initialize()
-        if is_macos:
+        if self.device_count == 0:
+            names = list()
+        elif IS_MACOS:
             names = [pynvx.cudaGetName(handle, ignore=True)
-                    for handle in self.handles]
+                     for handle in self.handles]
         else:
             names = [pynvml.nvmlDeviceGetName(handle).decode("utf-8")
-                    for handle in self.handles]
+                     for handle in self.handles]
+        if self.logger:
+            self.logger.debug("GPU Devices: %s", names)
         return names
 
     def get_vram(self):
         """ Return total vram in megabytes per device """
         self.initialize()
-        if is_macos:
+        if self.device_count == 0:
+            vram = list()
+        elif IS_MACOS:
             vram = [pynvx.cudaGetMemTotal(handle, ignore=True) / (1024 * 1024)
                     for handle in self.handles]
         else:
-            vram = [pynvml.nvmlDeviceGetMemoryInfo(handle).total / (1024 * 1024)
+            vram = [pynvml.nvmlDeviceGetMemoryInfo(handle).total /
+                    (1024 * 1024)
                     for handle in self.handles]
+        if self.logger:
+            self.logger.debug("GPU VRAM: %s", vram)
         return vram
 
     def get_used(self):
         """ Return the vram in use """
         self.initialize()
-        if is_macos:
+        if IS_MACOS:
             vram = [pynvx.cudaGetMemUsed(handle, ignore=True) / (1024 * 1024)
                     for handle in self.handles]
         else:
@@ -124,26 +168,39 @@ class GPUStats(object):
                     for handle in self.handles]
         self.shutdown()
 
-        if self.verbose:
-            print("GPU VRAM used:    {}".format(vram))
-
+        if self.logger:
+            self.logger.verbose("GPU VRAM used: %s", vram)
         return vram
 
     def get_free(self):
         """ Return the vram available """
         self.initialize()
-        if is_macos:
+        if IS_MACOS:
             vram = [pynvx.cudaGetMemFree(handle, ignore=True) / (1024 * 1024)
                     for handle in self.handles]
         else:
             vram = [pynvml.nvmlDeviceGetMemoryInfo(handle).free / (1024 * 1024)
                     for handle in self.handles]
         self.shutdown()
+        if self.logger:
+            self.logger.debug("GPU VRAM free: %s", vram)
         return vram
 
-    def print_info(self):
-        """ Output GPU info in verbose mode """
-        print("GPU Driver:       {}".format(self.driver))
-        print("GPU Device count: {}".format(self.device_count))
-        print("GPU Devices:      {}".format(self.devices))
-        print("GPU VRAM:         {}".format(self.vram))
+    def get_card_most_free(self):
+        """ Return the card and available VRAM for active card with
+            most VRAM free """
+        if self.device_count == 0:
+            return {"card_id": -1,
+                    "device": "No Nvidia devices found",
+                    "free": 2048,
+                    "total": 2048}
+        free_vram = [self.get_free()[i] for i in self.active_devices]
+        vram_free = max(free_vram)
+        card_id = self.active_devices[free_vram.index(vram_free)]
+        retval = {"card_id": card_id,
+                  "device": self.devices[card_id],
+                  "free": vram_free,
+                  "total": self.vram[card_id]}
+        if self.logger:
+            self.logger.debug("Active GPU Card with most free VRAM: %s", retval)
+        return retval
